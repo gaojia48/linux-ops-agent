@@ -1,0 +1,13 @@
+deepseek:
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  timeout_seconds: 30
+
+execution:
+  script_timeout_seconds: 25
+  reports_dir: reports
+  allow_high_risk: false
+
+agent:
+  fallback_to_keywords: true
+  max_skills_per_request: 3

@@ -1,0 +1,5 @@
+May 18 08:10:01 demo sshd[1001]: Failed password for invalid user admin from 203.0.113.10 port 53512 ssh2
+May 18 08:10:05 demo sshd[1002]: Failed password for root from 203.0.113.10 port 53513 ssh2
+May 18 08:11:09 demo sshd[1003]: Invalid user test from 198.51.100.20 port 42000
+May 18 08:12:15 demo sshd[1004]: Accepted password for student from 192.0.2.30 port 51000 ssh2
+May 18 08:13:20 demo sudo[1005]: authentication failure; logname= uid=1000 euid=0 tty=/dev/pts/0 ruser=student rhost=  user=root

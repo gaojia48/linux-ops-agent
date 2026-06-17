@@ -1,0 +1,28 @@
+name: log_analyze
+description: 分析系统日志、SSH 登录失败和高频错误
+script: scripts/log_analyze.sh
+risk_level: low
+keywords:
+  - log
+  - journalctl
+  - ssh
+  - auth
+  - failed
+  - error
+  - 日志
+  - 登录失败
+  - SSH
+  - 报错
+  - 故障
+inputs:
+  lines:
+    type: integer
+    default: 200
+allowed_commands:
+  - grep
+  - awk
+  - sed
+  - tail
+  - journalctl
+  - sort
+  - uniq

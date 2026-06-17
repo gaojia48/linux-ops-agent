@@ -1,0 +1,23 @@
+name: health_report
+description: 生成系统综合巡检报告，包含磁盘、日志、进程和网络摘要
+script: scripts/health_report.sh
+risk_level: low
+keywords:
+  - health
+  - report
+  - inspect
+  - 巡检
+  - 报告
+  - 健康
+  - 综合
+  - 每日
+  - daily
+inputs: {}
+allowed_commands:
+  - bash
+  - df
+  - free
+  - uptime
+  - ps
+  - ss
+  - journalctl

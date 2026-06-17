@@ -1,0 +1,23 @@
+name: network_check
+description: 检查网络地址、路由、监听端口和基础连通性
+script: scripts/network_check.sh
+risk_level: low
+keywords:
+  - network
+  - port
+  - ss
+  - ping
+  - ip
+  - route
+  - 网络
+  - 端口
+  - 监听
+  - 连通
+  - 路由
+inputs: {}
+allowed_commands:
+  - ip
+  - ss
+  - ping
+  - awk
+  - head

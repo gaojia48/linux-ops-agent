@@ -1,0 +1,25 @@
+name: process_check
+description: 检查 CPU、内存、负载和资源占用最高的进程
+script: scripts/process_check.sh
+risk_level: low
+keywords:
+  - process
+  - ps
+  - top
+  - cpu
+  - memory
+  - load
+  - 进程
+  - 内存
+  - 负载
+  - 卡顿
+  - 占用
+inputs: {}
+allowed_commands:
+  - ps
+  - top
+  - free
+  - uptime
+  - awk
+  - sort
+  - head

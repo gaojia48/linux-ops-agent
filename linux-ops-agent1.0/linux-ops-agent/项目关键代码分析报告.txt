@@ -1,0 +1,587 @@
+================================================================================
+        Linux Ops Agent — 项目关键代码分析报告
+================================================================================
+生成日期：2026-06-07
+
+【项目简介】
+基于 DeepSeek 大模型的 Linux 运维诊断 Agent 系统。核心思路：不让 AI 直接生成
+Shell 命令（危险），而是让 AI 从预先登记的安全 Skill 中选择，由本地程序执行
+受控脚本，最后汇总成诊断报告。
+
+技术栈：Python 3.10+ / Bash / YAML / DeepSeek API
+
+项目结构：
+  main.py          # 入口
+  config.yaml      # 配置
+  agent/           # 核心模块（6个文件）
+  skills/          # Skill 定义（5个YAML）
+  scripts/         # Shell 脚本（5个）
+  tests/           # 测试（6个）
+
+================================================================================
+一、核心架构：三阶段管道
+================================================================================
+
+整个系统按 "规划 → 执行 → 报告" 三个阶段运作，代码在 main.py 第 38-147 行：
+
+----------------------------------------------------------------
+阶段1 — 规划（Plan）: Planner 分析用户输入，选择执行哪些 Skill
+阶段2 — 执行（Execute）: SkillExecutor 在受控环境逐一运行脚本
+阶段3 — 报告（Report）: create_report 把输出汇总成 Markdown 报告
+----------------------------------------------------------------
+
+【main.py 核心流程代码】
+
+```python
+# main.py 第 38-147 行（核心流程）
+def main(argv: list[str] | None = None) -> int:
+    config = load_config(PROJECT_ROOT)
+    skills = load_skills(PROJECT_ROOT)
+
+    user_request = " ".join(args.request).strip()
+    use_llm = not args.no_llm
+    llm_client = DeepSeekClient(config.deepseek)
+
+    # ---- 阶段1: 规划 ----
+    if args.skill:
+        # 用户直接指定 skill，跳过 Planner
+        plan = Plan(skills=(args.skill,), reason="用户指定 skill", source="manual")
+    elif args.report == "daily":
+        # 每日巡检 → 固定选 health_report
+        plan = Plan(skills=("health_report",), reason="每日巡检", source="manual")
+    else:
+        # 通用路径：Planner 智能路由（LLM 或关键词）
+        planner = Planner(skills, llm_client=llm_client, max_skills=config.agent.max_skills_per_request)
+        plan = planner.plan(user_request, use_llm=use_llm)
+        # LLM 不可用时自动回退关键词
+        if use_llm and plan.source != "deepseek":
+            print(f"DeepSeek 未启用，已回退本地模式")
+
+    # 安全拦截：危险请求直接被拒绝
+    if plan.refused:
+        print(f"拒绝执行：{plan.refusal_reason}")
+        return 1
+
+    # ---- 阶段2: 执行 ----
+    selected_skills = [skills[name] for name in plan.skills if name in skills]
+    executor = SkillExecutor(PROJECT_ROOT, config.execution)
+    results = []
+    for skill in selected_skills:
+        result = executor.run(skill)      # 每个 skill 独立执行
+        results.append(result)
+        status = "OK" if result.ok else "FAILED"
+        print(f"[{skill.name}] {status} exit={result.exit_code} duration={result.duration_seconds:.2f}s")
+
+    # ---- 阶段3: 报告 ----
+    report_path = create_report(
+        user_request=user_request, plan=plan,
+        selected_skills=selected_skills, results=results,
+        reports_dir=config.execution.reports_dir,
+        llm_client=llm_client, use_llm=use_llm,
+    )
+    print(f"报告已生成：{report_path}")
+```
+
+================================================================================
+二、Planner：意图识别与安全拦截
+================================================================================
+
+Planner 是整个系统的"大脑"，决定用户输入该执行什么。核心文件 agent/planner.py。
+
+【Planner 完整代码】
+
+```python
+# agent/planner.py（核心部分）
+import json, re
+from dataclasses import dataclass
+from agent.llm_client import DeepSeekClient
+from agent.skill_loader import Skill
+
+# ---- 危险模式正则 ----
+DANGEROUS_PATTERNS = (
+    r"\brm\s+-rf\b",   # rm -rf 强制删除
+    r"删除所有", r"清空", r"格式化",
+    r"\bmkfs\b",       # 格式化文件系统
+    r"\bshutdown\b", r"\breboot\b",  # 关机重启
+    r"重启服务器", r"关闭服务器",
+)
+
+# ---- Plan 结果数据结构 ----
+@dataclass(frozen=True)
+class Plan:
+    skills: tuple[str, ...]     # 选中的 skill 名列表
+    reason: str                 # 为什么这样选
+    refused: bool = False       # 是否拒绝执行
+    refusal_reason: str = ""    # 拒绝原因
+    source: str = "keyword"     # 来源: deepseek / keyword / safety / manual
+    answer: str = ""            # LLM 对非运维问题的普通回答
+
+class Planner:
+    def __init__(self, skills, llm_client=None, max_skills=3):
+        self.skills = skills
+        self.llm_client = llm_client
+        self.max_skills = max_skills
+
+    def plan(self, user_request: str, use_llm: bool = True) -> Plan:
+        # === 第一道安全防线：危险请求拦截 ===
+        if self._looks_dangerous(user_request):
+            return Plan(
+                skills=(), reason="请求包含高风险系统操作",
+                refused=True,
+                refusal_reason="系统不会自动执行删除、格式化、关机、重启等破坏性操作。",
+                source="safety",
+            )
+
+        # === 优先走 LLM 路由 ===
+        if use_llm and self.llm_client and self.llm_client.available:
+            llm_plan = self._plan_with_llm(user_request)
+            if llm_plan:
+                return llm_plan
+
+        # === 回退到本地关键词 ===
+        return self._plan_with_keywords(user_request)
+
+    def _looks_dangerous(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(re.search(pattern, lowered) for pattern in DANGEROUS_PATTERNS)
+
+    def _plan_with_llm(self, user_request: str) -> Plan | None:
+        # 构造包含所有 skill 信息的 prompt
+        skill_catalog = [{
+            "name": s.name, "description": s.description,
+            "risk_level": s.risk_level, "keywords": list(s.keywords),
+        } for s in self.skills.values()]
+
+        prompt = (
+            "你是 Linux 运维 Agent 路由器。你只能从给定 skills 中选择 skill，"
+            "禁止输出任意 Shell 命令。\n"
+            "只有用户明确提出 Linux 运维诊断需求时，才选择 skill。\n"
+            "闲聊或普通问题必须返回空 skills，在 answer 字段正常回答。\n"
+            "必须只返回 JSON："
+            '{"skills":["disk_check"],"reason":"...","answer":""}\n'
+            f"最多选择 {self.max_skills} 个 skill。\n"
+            f"可用 skills: {json.dumps(skill_catalog, ensure_ascii=False)}\n"
+            f"用户请求: {user_request}"
+        )
+        try:
+            raw = self.llm_client.complete(prompt)
+            parsed = _parse_json_object(raw)    # 容错解析（处理 markdown 包裹）
+            selected = tuple(
+                name for name in parsed.get("skills", [])
+                if isinstance(name, str) and name in self.skills
+            )[:self.max_skills]
+            if selected:
+                return Plan(skills=selected, reason=parsed.get("reason",""),
+                            source="deepseek")
+            # 无匹配 skill → 返回 LLM 的普通回答
+            return Plan(skills=(), reason=parsed.get("reason",""),
+                        source="deepseek", answer=parsed.get("answer","").strip())
+        except Exception:
+            return None   # 异常时回退到关键词
+
+    def _plan_with_keywords(self, user_request: str) -> Plan:
+        lowered = user_request.lower()
+        scores = []
+        for skill in self.skills.values():
+            score = 0
+            # 命中一个关键词 +2 分
+            for keyword in skill.keywords:
+                if keyword and _keyword_matches(keyword, lowered):
+                    score += 2
+            # skill 名称中的 token 命中 +1 分
+            for token in re.split(r"\W+", skill.name.lower()):
+                if token and token in lowered:
+                    score += 1
+            if score:
+                scores.append((score, skill.name))
+
+        if not scores:
+            return Plan(skills=(), reason="未命中明确关键词", source="keyword")
+        selected = tuple(name for _, name in sorted(scores, reverse=True)[:self.max_skills])
+        return Plan(skills=selected, reason="本地关键词匹配", source="keyword")
+```
+
+【设计要点】
+- DANGEROUS_PATTERNS 是安全第一道防线，在规划阶段直接拒绝危险请求
+- LLM 路由要求返回 JSON，通过 prompt 约束"只能从列表选，禁止输出 Shell 命令"
+- 关键词路由作为可靠回退，中英文混合关键词覆盖常见运维场景
+- Plan 中 source 字段记录决策来源，增强可解释性
+
+================================================================================
+三、SkillExecutor：安全执行引擎
+================================================================================
+
+执行器负责在受控环境中运行脚本，核心文件 agent/executor.py。
+
+【Executor 完整代码】
+
+```python
+# agent/executor.py
+import subprocess, time
+from dataclasses import dataclass
+from pathlib import Path
+from agent.config import ExecutionConfig
+from agent.skill_loader import Skill
+
+class UnsafeSkillError(RuntimeError):
+    """安全校验失败时抛出"""
+    pass
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    skill_name: str
+    script: Path
+    stdout: str
+    stderr: str
+    exit_code: int
+    duration_seconds: float
+    timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return self.exit_code == 0 and not self.timed_out
+
+class SkillExecutor:
+    def __init__(self, project_root: Path, config: ExecutionConfig):
+        self.project_root = project_root.resolve()
+        self.config = config
+        self.scripts_root = (self.project_root / "scripts").resolve()
+
+    def _validate(self, skill: Skill) -> None:
+        """=== 安全校验：脚本必须在 scripts/ 目录下 ==="""
+        script = skill.script.resolve()
+        if not str(script).startswith(str(self.scripts_root) + "/"):
+            raise UnsafeSkillError(f"skill script must be under scripts/: {skill.script}")
+        # 高风险 skill 需显式允许
+        if skill.risk_level == "high" and not self.config.allow_high_risk:
+            raise UnsafeSkillError(f"high-risk skill is disabled: {skill.name}")
+
+    def run(self, skill: Skill) -> ExecutionResult:
+        self._validate(skill)
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                ["bash", str(skill.script)],
+                cwd=self.project_root,
+                text=True,
+                capture_output=True,                        # 分别捕获 stdout/stderr
+                timeout=self.config.script_timeout_seconds, # 超时保护
+                check=False,                                # 非零退出码不抛异常
+            )
+            return ExecutionResult(
+                skill_name=skill.name, script=skill.script,
+                stdout=completed.stdout, stderr=completed.stderr,
+                exit_code=completed.returncode,
+                duration_seconds=time.monotonic() - started,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # 超时也返回部分输出，方便分析
+            return ExecutionResult(
+                skill_name=skill.name, script=skill.script,
+                stdout=exc.stdout or "", stderr=(exc.stderr or "") + f"\nTimed out",
+                exit_code=124, duration_seconds=time.monotonic() - started,
+                timed_out=True,
+            )
+```
+
+【设计要点】
+- _validate 做路径前缀匹配，防止目录遍历攻击执行 scripts/ 外的文件
+- 高风险 skill（risk_level="high"）默认禁用，需改配置才能启用
+- subprocess.run 用 list 传参 ["bash", "script"]，避免 shell 注入
+- timeout 防止脚本卡死；超时后仍返回部分输出便于诊断
+
+================================================================================
+四、DeepSeekClient：LLM 集成
+================================================================================
+
+封装 DeepSeek API 调用，核心文件 agent/llm_client.py。
+
+```python
+# agent/llm_client.py（核心部分）
+import os
+from pathlib import Path
+from agent.config import DeepSeekConfig
+
+class DeepSeekClient:
+    def __init__(self, config: DeepSeekConfig):
+        _load_dotenv_if_available()           # python-dotenv 加载
+        _load_dotenv_manually(Path.cwd() / ".env")  # 手动兜底
+        _sanitize_proxy_env()                 # 清理 SOCKS 代理冲突
+        self.config = config
+        self.api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        self.model = os.getenv("DEEPSEEK_MODEL", config.model).strip() or config.model
+        self.base_url = os.getenv("DEEPSEEK_BASE_URL", config.base_url).strip() or config.base_url
+        self._client = None
+        self.last_error = ""
+
+    @property
+    def available(self) -> bool:
+        return bool(self.api_key)
+
+    def _ensure_client(self):
+        if self._client is None:
+            from openai import OpenAI
+            # 使用 OpenAI 兼容接口连接 DeepSeek
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return self._client
+
+    def complete(self, prompt: str, system: str | None = None) -> str:
+        if not self.available:
+            raise RuntimeError("没有读取到 DEEPSEEK_API_KEY")
+        client = self._ensure_client()
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.2,     # 低温度保证输出稳定
+            timeout=self.config.timeout_seconds,
+        )
+        return response.choices[0].message.content or ""
+
+    def summarize_report(self, user_request: str, raw_output: str) -> str:
+        """让 LLM 把脚本原始输出总结为结构化诊断报告"""
+        system = (
+            "你是 Linux 运维诊断助手。请根据命令输出写出简洁、可答辩展示的中文报告。"
+            "报告必须包含：问题概述、关键证据、可能原因、建议处理步骤、"
+            "涉及的 Linux 命令、风险提示。"
+        )
+        prompt = (
+            f"用户请求：{user_request}\n\n"
+            f"以下是受控 Shell 脚本的输出，请生成诊断报告：\n"
+            f"{raw_output[:12000]}"     # 截断防止超 token 限制
+        )
+        return self.complete(prompt, system=system)
+```
+
+【设计要点】
+- 使用 OpenAI 兼容协议，DeepSeek 只需改 base_url 即可接入
+- 双重 .env 加载（python-dotenv + 手动解析），确保密钥可靠获取
+- _sanitize_proxy_env 处理 SOCKS 代理冲突（常见坑）
+- temperature=0.2 低温度适合结构化/运维场景
+- 输出截断到 12000 字符，防止超出 token 限制
+
+================================================================================
+五、Skill 加载器
+================================================================================
+
+从 skills/*.yaml 加载 Skill 定义，核心文件 agent/skill_loader.py。
+
+```python
+# agent/skill_loader.py（核心部分）
+import yaml
+from dataclasses import dataclass
+from pathlib import Path
+
+@dataclass(frozen=True)
+class Skill:
+    name: str
+    description: str
+    script: Path               # 脚本路径
+    risk_level: str            # 风险等级: low / high
+    allowed_commands: tuple[str, ...]  # 允许的命令白名单
+    keywords: tuple[str, ...]  # 触发关键词（中英文混合）
+    inputs: tuple[SkillInput, ...]     # 输入参数
+
+def _load_skill_file(path: Path, project_root: Path) -> Skill:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    # 校验必填字段
+    required = ("name", "description", "script", "risk_level", "allowed_commands")
+    missing = [f for f in required if f not in data]
+    if missing:
+        raise ValueError(f"{path} missing: {missing}")
+
+    allowed = tuple(str(x) for x in data.get("allowed_commands", []))
+    if not allowed:
+        raise ValueError(f"{path} must declare at least one allowed command")
+
+    return Skill(
+        name=str(data["name"]),
+        description=str(data["description"]),
+        script=project_root / str(data["script"]),
+        risk_level=str(data["risk_level"]).lower(),
+        allowed_commands=allowed,
+        keywords=tuple(str(k).lower() for k in data.get("keywords", [])),
+        inputs=...,
+    )
+
+def load_skills(project_root: Path) -> dict[str, Skill]:
+    """扫描 skills/ 目录下所有 .yaml，返回 {name: Skill} 字典"""
+    root = project_root / "skills"
+    skills = {}
+    for path in sorted(root.glob("*.yaml")):
+        skill = _load_skill_file(path, project_root)
+        if skill.name in skills:
+            raise ValueError(f"duplicate skill: {skill.name}")
+        if not skill.script.exists():
+            raise FileNotFoundError(f"script not found: {skill.script}")
+        skills[skill.name] = skill
+    if not skills:
+        raise ValueError(f"no skills found in {root}")
+    return skills
+```
+
+【一个典型的 Skill YAML 定义 — disk_check.yaml】
+
+```yaml
+name: disk_check
+description: 检查磁盘空间、inode 使用率、日志目录占用和大文件
+script: scripts/disk_check.sh
+risk_level: low
+keywords:
+  - disk, df, du, inode     # 英文
+  - 磁盘, 空间, 容量, 大文件, 日志满  # 中文
+allowed_commands:
+  - df, du, find, awk, sort, tail
+inputs:
+  path:
+    type: string
+    default: /
+```
+
+================================================================================
+六、Shell 脚本核心逻辑
+================================================================================
+
+5 个脚本都放在 scripts/ 目录，由 executor 安全执行。以下是各脚本的核心命令。
+
+【disk_check.sh — 磁盘检查】
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+# 磁盘空间
+df -h
+# inode 使用率
+df -i
+# 筛选使用率 >= 80% 的分区
+df -P | awk 'NR>1 {pct=$5; gsub("%","",pct); if(pct+0>=80) print}'
+# /var/log 大目录 TOP 10
+du -xh /var/log 2>/dev/null | sort -h | tail -10
+# 查找 >100MB 的文件
+find /var/log -xdev -type f -size +100M -printf '%s %p\n' | sort -n | tail -20
+```
+
+【log_analyze.sh — 日志分析】
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+# 自动检测认证日志位置（兼容 Debian/Ubuntu 和 RHEL/CentOS）
+if [ -r /var/log/auth.log ]; then
+  AUTH_LOG="/var/log/auth.log"
+elif [ -r /var/log/secure ]; then
+  AUTH_LOG="/var/log/secure"
+fi
+
+# SSH 认证失败记录
+grep -Ei 'failed|failure|invalid' "$AUTH_LOG" | tail -30
+
+# 攻击源 IP TOP 10（从认证失败日志中提取并统计）
+grep -Ei 'failed password|invalid user' "$AUTH_LOG" \
+  | sed -nE 's/.*from ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+  | sort | uniq -c | sort -nr | head -10
+
+# 系统错误日志（优先 journalctl，回退 syslog/messages）
+journalctl -p warning..alert --since "24 hours ago" --no-pager | tail -50
+```
+
+【process_check.sh — 进程检查】
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+uptime                    # 负载
+free -h                   # 内存
+top -b -n 1 | head -5     # CPU 摘要
+ps aux --sort=-%cpu | head -11   # CPU TOP 10
+ps aux --sort=-%mem | head -11   # 内存 TOP 10
+# 进程状态统计：运行(R)、睡眠(S)、僵尸(Z)、不可中断(D)
+ps -eo stat= | awk '{count[$1]++} END {for(s in count) print s, count[s]}' | sort
+```
+
+【network_check.sh — 网络检查】
+
+```bash
+#!/usr/bin/env bash
+set -u
+
+ip -brief addr          # IP 地址
+ip route                # 路由表
+ss -tulnp | head -50    # 监听端口
+ping -c 2 -W 2 223.5.5.5   # IP 层连通性测试
+ping -c 2 -W 2 baidu.com   # DNS+域名连通性测试（能区分是网络不通还是 DNS 问题）
+```
+
+【health_report.sh — 综合巡检（调用上面四个）】
+
+```bash
+#!/usr/bin/env bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "######## Disk ########"
+bash "$SCRIPT_DIR/disk_check.sh"
+
+echo "######## Process ########"
+bash "$SCRIPT_DIR/process_check.sh"
+
+echo "######## Network ########"
+bash "$SCRIPT_DIR/network_check.sh"
+
+echo "######## Logs ########"
+bash "$SCRIPT_DIR/log_analyze.sh"
+```
+
+================================================================================
+七、安全设计（四道防线）
+================================================================================
+
+第一道：Planner 危险模式拦截 (planner.py)
+  → rm -rf、shutdown、reboot、格式化、mkfs 等请求直接拒绝
+
+第二道：Skill 命令白名单 (skill_loader.py)
+  → 每个 Skill 必须声明 allowed_commands，不能为空
+
+第三道：执行器路径校验 (executor.py)
+  → 脚本必须在 scripts/ 目录下，防止目录遍历执行外部文件
+  → 高风险 Skill 默认禁用 (allow_high_risk: false)
+
+第四道：运行时保护
+  → subprocess 传 list 防注入、超时限制 25 秒、不接受 LLM 生成的命令
+
+================================================================================
+八、配置 (config.yaml)
+================================================================================
+
+```yaml
+deepseek:
+  base_url: https://api.deepseek.com
+  model: deepseek-v4-flash
+  timeout_seconds: 30
+
+execution:
+  script_timeout_seconds: 25
+  reports_dir: reports
+  allow_high_risk: false        # 默认不允许高风险操作
+
+agent:
+  fallback_to_keywords: true    # LLM 不可用时自动回退关键词
+  max_skills_per_request: 3     # 单次最多选 3 个 skill
+```
+
+================================================================================
+九、系统依赖
+================================================================================
+
+Python: openai>=1.0.0, python-dotenv>=1.0.0, PyYAML>=6.0.0, pytest>=8.0.0
+系统命令: df, du, find, grep, sed, awk, sort, tail, head, uniq, ps, top,
+          free, uptime, ip, ss, ping, journalctl, bash
+
+================================================================================
+                           报告结束
+================================================================================

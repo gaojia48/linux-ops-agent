@@ -1,0 +1,25 @@
+name: disk_check
+description: 检查磁盘空间、inode 使用率、日志目录占用和大文件
+script: scripts/disk_check.sh
+risk_level: low
+keywords:
+  - disk
+  - df
+  - du
+  - inode
+  - 磁盘
+  - 空间
+  - 容量
+  - 大文件
+  - 日志满
+inputs:
+  path:
+    type: string
+    default: /
+allowed_commands:
+  - df
+  - du
+  - find
+  - awk
+  - sort
+  - tail

@@ -1,0 +1,66 @@
+643c22c 添加日志样本和脚本测试
+M	scripts/log_analyze.sh
+A	tests/sample_logs/auth.log
+A	tests/test_log_analyze_script.py
+6937523 添加课程项目报告文档
+A	"docs/\351\241\271\347\233\256\346\212\245\345\221\212.md"
+be89ff4 添加答辩演示流程文档
+A	"docs/\346\274\224\347\244\272\346\265\201\347\250\213.md"
+d9bb08a 添加运行环境自检命令
+M	main.py
+f80efbf 添加最新报告查看命令
+M	main.py
+A	tests/test_main_helpers.py
+72f26cc 添加 ops 报告查看和清理命令
+M	main.py
+9b05802 未匹配请求不再默认执行运维 skill
+M	agent/planner.py
+M	main.py
+M	tests/test_planner.py
+9c1d55f 添加 ops 便捷入口和交互模式
+M	README.md
+M	main.py
+A	ops
+88a63f0 修复 DeepSeek 代理兼容问题
+M	agent/llm_client.py
+589fa54 改进 DeepSeek 环境诊断提示
+M	agent/llm_client.py
+M	main.py
+abeb472 设置运维脚本可执行权限
+M	scripts/disk_check.sh
+M	scripts/health_report.sh
+M	scripts/log_analyze.sh
+M	scripts/network_check.sh
+M	scripts/process_check.sh
+b746c73 初始实现 Linux 运维 Agent 系统
+A	.env.example
+A	.gitignore
+A	README.md
+A	agent/__init__.py
+A	agent/config.py
+A	agent/executor.py
+A	agent/llm_client.py
+A	agent/planner.py
+A	agent/report.py
+A	agent/skill_loader.py
+A	config.yaml
+A	"docs/\344\275\277\347\224\250\350\257\264\346\230\216.md"
+A	"docs/\346\265\213\350\257\225\346\212\245\345\221\212.md"
+A	"docs/\351\241\271\347\233\256\350\247\204\345\210\222\344\271\246.md"
+A	main.py
+A	pytest.ini
+A	requirements.txt
+A	scripts/disk_check.sh
+A	scripts/health_report.sh
+A	scripts/log_analyze.sh
+A	scripts/network_check.sh
+A	scripts/process_check.sh
+A	skills/disk_check.yaml
+A	skills/health_report.yaml
+A	skills/log_analyze.yaml
+A	skills/network_check.yaml
+A	skills/process_check.yaml
+A	tests/test_executor.py
+A	tests/test_planner.py
+A	tests/test_report.py
+A	tests/test_skill_loader.py

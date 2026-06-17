@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -x "$ROOT_DIR/.venv/bin/python" ]; then
+  PYTHON="$ROOT_DIR/.venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
+if [ "$#" -eq 0 ]; then
+  exec "$PYTHON" "$ROOT_DIR/main.py" --interactive
+fi
+
+if [ "$#" -eq 1 ] && [ "$1" = "--no-llm" ]; then
+  exec "$PYTHON" "$ROOT_DIR/main.py" --interactive --no-llm
+fi
+
+exec "$PYTHON" "$ROOT_DIR/main.py" "$@"
